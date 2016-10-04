@@ -1,4 +1,4 @@
-Recommender
+PyRecSys
 =======
 
 Python Collaborative Filtering
