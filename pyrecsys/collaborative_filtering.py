@@ -120,13 +120,49 @@ class ALS():
 
         Cui, Ciu = Cui.tocsr(), Cui.T.tocsr()
 
-        solver = self._least_squares
+        #solver = self._implicit_least_squares
+        solver = self._explicit_least_squares
 
         for iteration in range(self.n_iter):
             solver(Cui, self.rows_, self.columns_, self.lambda_)
             solver(Ciu, self.columns_, self.rows_, self.lambda_)
 
-    def _least_squares(self, Cui, X, Y, regularization):
+    def _explicit_least_squares(self, Cui, X, Y, regularization):
+        users, factors = X.shape
+        YtY = Y.T.dot(Y)
+        #print(YtY.shape)
+
+        #X = np.linalg.solve(YtY + regularization * np.eye(factors), np.dot(Y.T, Cui.T)).T
+
+        for u in range(users):
+            # accumulate YtCuY + regularization*I in A
+            A = YtY + regularization * np.eye(factors)
+
+            # accumulate YtCuPu in b
+            b = np.zeros(factors)
+
+            for i, confidence in self._nonzeros(Cui, u):
+                factor = Y[i]
+                b += confidence * factor
+
+            X[u] = np.linalg.solve(A, b)
+
+    def _implicit_least_squares_(self, Cui, X, Y, regularization):
+
+        users, factors = X.shape
+        YtY = Y.T.dot(Y)
+
+        #self.alpha = 0.1
+        for u in range(users):
+            indexes = [x[0] for x in self._nonzeros(Cui, u)]
+            if len(indexes) > 0:
+                Hix = Y[indexes, :]
+                M = YtY + self.alpha * Hix.T.dot(Hix) + np.diag(self.lambda_ * np.eye(factors))
+                X[u] = np.dot(np.linalg.inv(M), (1 + self.alpha) * Hix.sum(axis=0))
+            else:
+                X[u] = np.zeros(factors)
+
+    def _implicit_least_squares(self, Cui, X, Y, regularization):
         """ For each user in Cui, calculate factors Xu for them
         using least squares on Y.
         """
