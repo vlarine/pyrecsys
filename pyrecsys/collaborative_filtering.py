@@ -4,6 +4,14 @@
 # License: MIT
 
 import numpy as np
+import scipy.sparse as sp
+
+GOT_NUMBA = True
+try:
+    #import numba
+    from pyrecsys._polara.lib.hosvd import tucker_als
+except ImportError:
+    GOT_NUMBA = False
 
 __all__ = ['ALS', ]
 
@@ -53,7 +61,8 @@ class ALS():
     """
 
     def __init__(self, n_components=15, lambda_=0.01, alpha=15, n_iter=20,
-                 method='implicit', n_jobs=1, random_state=None):
+                 method='implicit', n_jobs=1, rank=5, growth_tol=0.0001,
+                 mlrank=(13, 10, 2), random_state=None):
         self.n_components = n_components
         self.lambda_ = lambda_
         self.alpha = alpha
@@ -61,6 +70,9 @@ class ALS():
         self.method = method
         self.n_jobs = n_jobs
         self.random_state = random_state
+        self.rank = rank
+        self.mlrank = mlrank
+        self.growth_tol = growth_tol
 
     def fit(self, X):
         """Learn an ALS model.
@@ -76,7 +88,19 @@ class ALS():
             Returns the instance itself.
         """
 
-        self._als((np.array(X) * self.alpha).astype('double'))
+        if self.method == 'implicit':
+            self._als(X * self.alpha)
+        elif self.method == 'explicit':
+            self._als(X)
+        elif self.method == 'polara':
+            if GOT_NUMBA:
+                self._polara_als(X)
+            else:
+                raise ImportError('Numba not installed')
+        else:
+            raise NotImplementedError('Method {} is not implemented.'.format(self.method))
+
+
         return self
 
     def predict(self, X):
@@ -94,10 +118,19 @@ class ALS():
         """
 
         pred = []
-        for item in X:
-            i = item[0]
-            j = item[1]
-            pred.append(self.rows_[i, :].dot(self.columns_[j, :]))
+        if self.method == 'polara':
+            u, v, w, c = self.rows_, self.columns_, self.feedback_factors_, self.core_
+            for item in X:
+                i = item[0]
+                j = item[1]
+                p = v[j, :].dot(c.T.dot(u[i, :]).T).dot(w.T).argmax()
+                p = p * (self.x_max_ - self.x_min_) + self.x_min_
+                pred.append(p)
+        else:
+            for item in X:
+                i = item[0]
+                j = item[1]
+                pred.append(self.rows_[i, :].dot(self.columns_[j, :]))
         return np.array(pred)
 
     def _nonzeros(self, m, row):
@@ -120,12 +153,54 @@ class ALS():
 
         Cui, Ciu = Cui.tocsr(), Cui.T.tocsr()
 
-        #solver = self._implicit_least_squares
-        solver = self._explicit_least_squares
+        if self.method == 'implicit':
+            solver = self._implicit_least_squares
+        elif self.method == 'explicit':
+            solver = self._explicit_least_squares
+        else:
+            raise NotImplementedError('Method {} is not implemented.'.format(self.method))
 
         for iteration in range(self.n_iter):
             solver(Cui, self.rows_, self.columns_, self.lambda_)
             solver(Ciu, self.columns_, self.rows_, self.lambda_)
+
+    def _polara_als(self, Cui):
+        #print('Start')
+
+        Cui = sp.coo_matrix(Cui)
+        self.x_min_ = Cui.data.min()
+        self.x_max_ = Cui.data.max()
+        Cui.data -= self.x_min_
+        if self.x_max_ > self.x_min_:
+            Cui.data /= (self.x_max_ - self.x_min_)
+        Cui.data *= (self.rank - 0.000001)
+
+        #print(Cui.data.shape)
+        #print(Cui.data[:10])
+
+
+        Cui = np.ascontiguousarray(np.transpose(np.array((Cui.row, Cui.col, Cui.data), dtype=np.int64)))
+        shp = tuple(Cui.max(axis=0) + 1)
+        val = np.ascontiguousarray(np.ones(Cui.shape[0], ))
+
+
+        #print(Cui.shape)
+        #print(Cui[:10])
+        #print(shp)
+
+        #exit()
+        #idx, val, shp = self.data.to_coo(tensor_mode=True)
+        users_factors, items_factors, feedback_factors, core = \
+                            tucker_als(Cui, val, shp, self.mlrank,
+                            growth_tol=self.growth_tol,
+                            iters=self.n_iter,
+                            batch_run=False)
+        self.rows_ = users_factors
+        self.columns_ = items_factors
+        self.feedback_factors_ = feedback_factors
+        self.core_ = core
+
+
 
     def _explicit_least_squares(self, Cui, X, Y, regularization):
         users, factors = X.shape
@@ -184,3 +259,8 @@ class ALS():
 
             # Xu = (YtCuY + regularization * I)^-1 (YtCuPu)
             X[u] = np.linalg.solve(A, b)
+
+
+
+
+
