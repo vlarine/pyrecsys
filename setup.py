@@ -6,7 +6,7 @@ import pyrecsys
 setup(
     name='pyrecsys',
     version=pyrecsys.__version__,
-    packages=find_packages(),
+    packages=['pyrecsys', 'pyrecsys._polara.lib'],
     author = "Vladimir Larin",
     author_email = "vladimir@vlarine.ru",
     description = "Collaborative filtering recommender system",
