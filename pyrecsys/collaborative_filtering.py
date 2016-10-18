@@ -124,7 +124,9 @@ class ALS():
                 i = item[0]
                 j = item[1]
                 p = v[j, :].dot(c.T.dot(u[i, :]).T).dot(w.T).argmax()
-                p = p * (self.x_max_ - self.x_min_) + self.x_min_
+                #print(p)
+                p = p * (self.x_max_ - self.x_min_) / (self.rank + 0.000001) + self.x_min_
+                #print(p, self.x_min_, self.x_max_)
                 pred.append(p)
         else:
             for item in X:
