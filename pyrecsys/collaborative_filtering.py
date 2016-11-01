@@ -5,16 +5,65 @@
 
 import numpy as np
 import scipy.sparse as sp
+import six
 
 GOT_NUMBA = True
 try:
-    #import numba
     from pyrecsys._polara.lib.hosvd import tucker_als
 except ImportError:
     GOT_NUMBA = False
 
 __all__ = ['ALS', ]
 
+
+###############################################################################
+def _pprint(params, offset=0, printer=repr):
+    """Pretty print the dictionary 'params'
+    Parameters
+    ----------
+    params: dict
+        The dictionary to pretty print
+    offset: int
+        The offset in characters to add at the begin of each line.
+    printer:
+        The function to convert entries to strings, typically
+        the builtin str or repr
+    """
+    # Do a multi-line justified repr:
+    options = np.get_printoptions()
+    np.set_printoptions(precision=5, threshold=64, edgeitems=2)
+    params_list = list()
+    this_line_length = offset
+    line_sep = ',\n' + (1 + offset // 2) * ' '
+    for i, (k, v) in enumerate(sorted(six.iteritems(params))):
+        if type(v) is float:
+            # use str for representing floating point numbers
+            # this way we get consistent representation across
+            # architectures and versions.
+            this_repr = '%s=%s' % (k, str(v))
+        else:
+            # use repr of the rest
+            this_repr = '%s=%s' % (k, printer(v))
+        if len(this_repr) > 500:
+            this_repr = this_repr[:300] + '...' + this_repr[-100:]
+        if i > 0:
+            if (this_line_length + len(this_repr) >= 75 or '\n' in this_repr):
+                params_list.append(line_sep)
+                this_line_length = len(line_sep)
+            else:
+                params_list.append(', ')
+                this_line_length += 2
+        params_list.append(this_repr)
+        this_line_length += len(this_repr)
+
+    np.set_printoptions(**options)
+    lines = ''.join(params_list)
+    # Strip trailing space to avoid nightmare in doctests
+    lines = '\n'.join(l.rstrip(' ') for l in lines.split('\n'))
+    return lines
+
+
+###############################################################################
 class ALS():
     """ Alternating Least Squares for Collaborative Filtering
 
@@ -36,8 +85,17 @@ class ALS():
     n_iter: int, optional, default: 20
         The number of iterations of the ALS algorithm.
 
-    method: 'implicit' | 'explicit', default: 'implicit'
+    method: 'implicit' | 'explicit' | 'polara', default: 'implicit'
         The ALS method. For now supports implicit ALS only.
+
+    rank: int, optional, default: 5
+        Polara-specific. Base rating rank.
+
+    growth_tol: float, optional, dedault: 0.0001
+        Polara-specific. Threshold for early stopping.
+
+    mlrank: (int, int, int), optional, default: (13, 10, 2)
+        Polara-specific. Tuple of model ranks.
 
     n_jobs: int, optional, default: 1
         The number of jobs to use for computation.
@@ -46,6 +104,8 @@ class ALS():
     random_state: int seed or None (default)
         Random number generator seed.
 
+    verbose: int, optional (default=0)
+        Controls the verbosity of the model building process.
 
     References
     ----------
@@ -58,11 +118,16 @@ class ALS():
     for Implicit Datasets.
     https://github.com/benfred/implicit
 
+    Evgeny Frolov, Ivan Oseledets. Fifty Shades of Ratings: How to Benefit
+    from a Negative Feedback in Top-N Recommendations Tasks.
+    https://arxiv.org/abs/1607.04228
+    https://github.com/Evfro/polara
+
     """
 
     def __init__(self, n_components=15, lambda_=0.01, alpha=15, n_iter=20,
                  method='implicit', n_jobs=1, rank=5, growth_tol=0.0001,
-                 mlrank=(13, 10, 2), random_state=None):
+                 mlrank=(13, 10, 2), random_state=None, verbose=0):
         self.n_components = n_components
         self.lambda_ = lambda_
         self.alpha = alpha
@@ -73,6 +138,8 @@ class ALS():
         self.rank = rank
         self.mlrank = mlrank
         self.growth_tol = growth_tol
+        self.verbose = verbose
+        self._eps = 0.0000001 # Small value for evoid a division by zero
 
     def fit(self, X):
         """Learn an ALS model.
@@ -96,7 +163,7 @@ class ALS():
             if GOT_NUMBA:
                 self._polara_als(X)
             else:
-                raise ImportError('Numba not installed')
+                raise ImportError('Numba is not installed')
         else:
             raise NotImplementedError('Method {} is not implemented.'.format(self.method))
 
@@ -127,9 +194,7 @@ class ALS():
                     p = v[j, :].dot(c.T.dot(u[i, :]).T).dot(w.T).argmax()
                 else:
                     p = (self.rank - 1) / 2
-                #print(p)
-                p = p * (self.x_max_ - self.x_min_) / (self.rank + 0.000001) + self.x_min_
-                #print(p, self.x_min_, self.x_max_)
+                p = p * (self.x_max_ - self.x_min_) / (self.rank + self._eps) + self.x_min_
                 pred.append(p)
         else:
             for item in X:
@@ -170,36 +235,23 @@ class ALS():
             solver(Ciu, self.columns_, self.rows_, self.lambda_)
 
     def _polara_als(self, Cui):
-        #print('Start')
-
         Cui = sp.coo_matrix(Cui)
         self.x_min_ = Cui.data.min()
         self.x_max_ = Cui.data.max()
         Cui.data -= self.x_min_
         if self.x_max_ > self.x_min_:
             Cui.data /= (self.x_max_ - self.x_min_)
-        Cui.data *= (self.rank - 0.000001)
-
-        #print(Cui.data.shape)
-        #print(Cui.data[:10])
-
+        Cui.data *= (self.rank - self._eps)
 
         Cui = np.ascontiguousarray(np.transpose(np.array((Cui.row, Cui.col, Cui.data), dtype=np.int64)))
         shp = tuple(Cui.max(axis=0) + 1)
         val = np.ascontiguousarray(np.ones(Cui.shape[0], ))
 
-
-        #print(Cui.shape)
-        #print(Cui[:10])
-        #print(shp)
-
-        #exit()
-        #idx, val, shp = self.data.to_coo(tensor_mode=True)
         users_factors, items_factors, feedback_factors, core = \
                             tucker_als(Cui, val, shp, self.mlrank,
                             growth_tol=self.growth_tol,
                             iters=self.n_iter,
-                            batch_run=False)
+                            batch_run=False if self.verbose else True)
         self.rows_ = users_factors
         self.columns_ = items_factors
         self.feedback_factors_ = feedback_factors
@@ -210,9 +262,6 @@ class ALS():
     def _explicit_least_squares(self, Cui, X, Y, regularization):
         users, factors = X.shape
         YtY = Y.T.dot(Y)
-        #print(YtY.shape)
-
-        #X = np.linalg.solve(YtY + regularization * np.eye(factors), np.dot(Y.T, Cui.T)).T
 
         for u in range(users):
             # accumulate YtCuY + regularization*I in A
@@ -232,7 +281,6 @@ class ALS():
         users, factors = X.shape
         YtY = Y.T.dot(Y)
 
-        #self.alpha = 0.1
         for u in range(users):
             indexes = [x[0] for x in self._nonzeros(Cui, u)]
             if len(indexes) > 0:
@@ -265,7 +313,32 @@ class ALS():
             # Xu = (YtCuY + regularization * I)^-1 (YtCuPu)
             X[u] = np.linalg.solve(A, b)
 
+    def get_params(self):
+        """Get parameters for this model.
 
+        Returns
+        -------
+        params : mapping of string to any
+            Parameter names mapped to their values.
+        """
+        out = dict()
+
+        names = ['n_components', 'lambda_', 'alpha', 'n_iter',\
+                 'method', 'n_jobs', 'random_state', 'verbose']
+        if self.method == 'polara':
+            names += ['rank', 'mlrank', 'growth_tol']
+
+        for key in names:
+            out[key] = getattr(self, key, None)
+
+        return out
+
+
+
+    def __repr__(self):
+        class_name = self.__class__.__name__
+        return '%s(%s)' % (class_name, _pprint(self.get_params(),
+                                               offset=len(class_name),),)
 
 
 
